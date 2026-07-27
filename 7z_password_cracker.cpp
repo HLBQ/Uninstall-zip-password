@@ -296,7 +296,7 @@ int wmain(int argc, wchar_t* argv[]) {
         DWORD srcAttr = GetFileAttributesW(cfg.compressSrc.c_str());
         if (srcAttr == INVALID_FILE_ATTRIBUTES) { msg(L"[ERROR]|打包源不存在"); return 3; }
         wchar_t ed[1024] = {}; GetModuleFileNameW(0, ed, 1024); wstring ddd(ed); size_t ls = ddd.find_last_of(L"\\/"); wstring es = (ls != wstring::npos) ? ddd.substr(0, ls + 1) : L".";
-        const wchar_t* dl[] = { L"7z_26.dll",L"7z_22.dll",L"7z_19.dll" }; bit7z::Bit7zLibrary* pL = 0;
+        const wchar_t* dl[] = { L"7z.dll" }; bit7z::Bit7zLibrary* pL = 0;
         for (auto d : dl) { wstring dp = es + d; if (GetFileAttributesW(dp.c_str()) != INVALID_FILE_ATTRIBUTES && LoadLibraryW(dp.c_str())) { FreeLibrary(GetModuleHandleW(dp.c_str())); pL = new bit7z::Bit7zLibrary(dp); break; } }
         if (!pL) { msg(L"[ERROR]|无法加载7z DLL"); return 11; }
         // 确定压缩格式和扩展名
@@ -402,7 +402,7 @@ int wmain(int argc, wchar_t* argv[]) {
     if (startIdx>=totalPwds) { msg(L"[ERROR]|断点超出总数"); return 5; }
 
     wchar_t ed[1024]={}; GetModuleFileNameW(0,ed,1024); wstring ddd(ed); size_t ls=ddd.find_last_of(L"\\/"); wstring es=(ls!=wstring::npos)?ddd.substr(0,ls+1):L".";
-    const wchar_t* dl[]={L"7z_26.dll",L"7z_22.dll",L"7z_19.dll"}; bit7z::Bit7zLibrary* pL=0;
+    const wchar_t* dl[]={L"7z.dll"}; bit7z::Bit7zLibrary* pL=0;
     for (auto d:dl) { wstring dp=es+d; if (GetFileAttributesW(dp.c_str())!=INVALID_FILE_ATTRIBUTES&&LoadLibraryW(dp.c_str())) { FreeLibrary(GetModuleHandleW(dp.c_str())); pL=new bit7z::Bit7zLibrary(dp); break; } }
     if (!pL&&!cfg.isRar) { msg(L"[ERROR]|无法加载7z DLL"); return 11; }
     wstring urDll=es+L"unrar.dll"; const auto& fmt=cfg.fileType.empty()?detectFmt(cfg.archivePath):parseType(cfg.fileType);
