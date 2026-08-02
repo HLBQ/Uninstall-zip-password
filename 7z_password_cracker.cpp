@@ -428,14 +428,28 @@ int wmain(int argc, wchar_t* argv[]) {
     bool found=false;
     mutex outMtx; atomic<bool> stopFlag{false}; uint64_t lastReported=startIdx;
 
+    // RAR 可靠性检测 (一次性, 全局有效; 提前到阶段1之前)
+    bool rarUse7z=false;
+    if (cfg.isRar) {
+        TestResult t1=tryPwdRarFast(testPath,L"__CHK_A__",urDll);
+        TestResult t2=tryPwdRarFast(testPath,L"__CHK_B__",urDll);
+        rarUse7z=(t1==TestResult::Success&&t2==TestResult::Success);
+        if (rarUse7z) msg(L"[INFO]|RAR加密文件名, 使用7z解密");
+        else msg(L"[INFO]|RAR普通, 使用unrar解密");
+    }
+
     // === 阶段1: 密码本 (单线程, 逐条) ===
     uint64_t pbEnd=min(book.bc,(endIdx==UINT64_MAX?book.bc:endIdx+1));
     for (uint64_t i=startIdx; i<pbEnd&&!stopFlag.load(); ++i) {
         wstring pwd=book.get(i); msg(L"[STATUS]|",i+1,L"|",totalPwds,L"|",pwd);
-        wstring err; TestResult r; ExtractorCtx ctx; ctx.init(*pL,fmt,useCache);
-        if (cfg.isRar) { r=tryPwdRarFast(testPath,pwd,urDll);
-            if (r==TestResult::Success) { /* verify later */ r=tryPwd7z(ctx,testPath,useCache?&mA.data:nullptr,pwd,err); } }
-        else r=tryPwd7z(ctx,testPath,useCache?&mA.data:nullptr,pwd,err);
+        wstring err; TestResult r;
+        if (cfg.isRar&&!rarUse7z) {
+            // unrar 已确认可靠: 成功即密码正确
+            r=tryPwdRarFast(testPath,pwd,urDll);
+        } else {
+            ExtractorCtx ctx; ctx.init(*pL,fmt,useCache);
+            r=tryPwd7z(ctx,testPath,useCache?&mA.data:nullptr,pwd,err);
+        }
         if (r==TestResult::Success) { msg(L"[FOUND]|",pwd); found=true; stopFlag.store(true); break; }
         if (r==TestResult::Error) { msg(L"[ERROR]|",err); if (isMerged) DeleteFileW(mf.c_str()); delete pL; return 7; }
     }
@@ -446,16 +460,6 @@ int wmain(int argc, wchar_t* argv[]) {
         uint64_t brEnd=min((endIdx==UINT64_MAX?totalPwds-1:endIdx),totalPwds-1);
         uint64_t brCount=(brEnd>=brStart)?(brEnd-brStart+1):0;
         uint64_t lastPreserved=brStart;
-
-        // RAR 可靠性检测 (一次性)
-        bool rarUse7z=false;
-        if (cfg.isRar) {
-            TestResult t1=tryPwdRarFast(testPath,L"__CHK_A__",urDll);
-            TestResult t2=tryPwdRarFast(testPath,L"__CHK_B__",urDll);
-            rarUse7z=(t1==TestResult::Success&&t2==TestResult::Success);
-            if (rarUse7z) msg(L"[INFO]|RAR加密文件名, 使用7z解密");
-            else msg(L"[INFO]|RAR普通, 使用unrar解密");
-        }
 
         // 是否启用多线程: 任务数>线程数 且 线程数>1
         bool useMt=(brCount>(uint64_t)nThreads)&&(nThreads>1);
@@ -469,9 +473,9 @@ int wmain(int argc, wchar_t* argv[]) {
 
             // Worker 统一入口
             auto worker = [&](int tid) {
-                // 每个 worker 独立的验证上下文 (始终初始化, 用于 rar uncrypt 阶段的 fallback)
+                // 每个 worker 独立的验证上下文 (仅在需要 bit7z 时初始化)
                 ExtractorCtx ctx;
-                ctx.init(*pL, fmt, useCache);
+                if (!cfg.isRar || rarUse7z) ctx.init(*pL, fmt, useCache);
 
                 while (!stopFlag.load()) {
                     uint64_t base = nextAtom.fetch_add((uint64_t)bsz);
@@ -481,8 +485,8 @@ int wmain(int argc, wchar_t* argv[]) {
                         wstring pwd = book.get(i);
                         wstring err; TestResult r;
                         if (cfg.isRar && !rarUse7z) {
+                            // unrar 已确认可靠: 成功即密码正确
                             r = tryPwdRarFast(testPath, pwd, urDll);
-                            if (r == TestResult::Success) { /* verify */ r = useCache ? ctx.test(L"", &mA.data, pwd, err) : ctx.test(testPath, nullptr, pwd, err); }
                         } else {
                             r = useCache ? ctx.test(L"", &mA.data, pwd, err) : ctx.test(testPath, nullptr, pwd, err);
                         }
@@ -530,8 +534,8 @@ int wmain(int argc, wchar_t* argv[]) {
                 if (sp) msg(L"[STATUS]|",i+1,L"|",totalPwds,L"|",pwd);
                 wstring err; TestResult r;
                 if (cfg.isRar&&!rarUse7z) {
+                    // unrar 已确认可靠: 成功即密码正确
                     r=tryPwdRarFast(testPath,pwd,urDll);
-                    if (r==TestResult::Success) r=useCache?ctx.test(L"", &mA.data, pwd, err):ctx.test(testPath, nullptr, pwd, err);
                 } else r=useCache?ctx.test(L"",&mA.data,pwd,err):ctx.test(testPath,nullptr,pwd,err);
                 if (r==TestResult::Success) { msg(L"[FOUND]|",pwd); found=true; break; }
                 if (r==TestResult::Error) { msg(L"[ERROR]|",err); if (isMerged) DeleteFileW(mf.c_str()); delete pL; return 7; }
