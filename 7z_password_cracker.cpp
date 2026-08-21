@@ -1,4 +1,12 @@
-/** 7z Password Cracker v4 — 多线程批量处理 */
+/** 7z Password Cracker v6 — 单线程 + 密码编码可选(-enc)
+ *
+ *  v6 变更:
+ *   1. 彻底移除多线程 (unrar.dll 不可重入)
+ *   2. 新增 -enc <编码列表> 参数: 构造密码编码变体, 支持 utf8/gbk/gb2312/big5/sjis,
+ *      多值用逗号分隔; 默认不构造变体(仅原样, 按系统代码页)
+ *   3. 移除 -tr / -bt 参数
+ *   4. 修正 RAR unrar.dll 可用性检测
+ */
 
 #include <iostream>
 #include <fstream>
@@ -10,19 +18,12 @@
 #include <io.h>
 #include <fcntl.h>
 #include <Windows.h>
-#include <atomic>
-#include <thread>
-#include <mutex>
-#include <chrono>
 
 #include "bit7z.hpp"
 #include "bitmemextractor.hpp"
 
 #pragma pack(push, 1)
 #define ERAR_BAD_PASSWORD       24
-#define RAR_OM_EXTRACT          1
-#define RAR_TEST                1
-#define RAR_EXTRACT             2
 #define RAR_OM_LIST_INCSPLIT    2
 
 struct RARHeaderDataEx {
@@ -111,11 +112,10 @@ struct CmdConfig {
     string compressType = "zip"; // -i 压缩类型, 默认zip
     uint64_t startN = 1, endN = 0, printStep = 1;
     string fileType;
+    string encStr; // -enc 密码编码列表, 逗号分隔; 空=仅原样
     CacheMode cache = CacheMode::Auto;
     bool isRar = false, isExtract = false, isCompress = false, hasDict = false, hasPb = false;
-    bool compressDelete = false; // -d 压缩后删除原文件
-    int threads = 1;     // -tr, 1=默认单线程
-    int batchSize = 2048; // -bt, 多线程下每批任务数
+    bool deleteSrc = false; // -d 解压/压缩后删除源文件
 };
 
 // ===================== Parse =====================
@@ -145,10 +145,9 @@ static CmdConfig parseArgs(int argc, wchar_t* argv[]) {
         if (a == L"-s"&&i+1<argc) { cfg.startN=wcstoull(argv[++i],0,10); continue; }
         if (a == L"-e"&&i+1<argc) { cfg.endN=wcstoull(argv[++i],0,10); continue; }
         if (a == L"-ps"&&i+1<argc) { cfg.extractPwd=argv[++i]; continue; }
-        if (a == L"-tr"&&i+1<argc) { cfg.threads=(int)wcstoul(argv[++i],0,10); continue; }
-        if (a == L"-bt"&&i+1<argc) { cfg.batchSize=(int)wcstoul(argv[++i],0,10); if (cfg.batchSize<1) cfg.batchSize=1; continue; }
         if (a == L"-pt"&&i+1<argc) { cfg.printStep=wcstoull(argv[++i],0,10); continue; }
-        if (a == L"-d") { cfg.compressDelete=true; continue; }
+        if (a == L"-enc"&&i+1<argc) { cfg.encStr=u8(wstring(argv[++i])); continue; }
+        if (a == L"-d") { cfg.deleteSrc=true; continue; }
         if (a == L"-b") { cfg.cache=CacheMode::Force; continue; }
         if (a == L"-nb") { cfg.cache=CacheMode::Disable; continue; }
     }
@@ -202,6 +201,61 @@ struct PwdBook {
     wstring get(uint64_t i) const { if (i<bc) return lines[(size_t)i]; return idxPwd(i-bc,charset,ts,te); }
 };
 
+// ===================== 密码编码变体 =====================
+// 不同工具创建加密包时, 中文密码会按不同编码存为字节:
+//   - Windows 传统工具 (7z.exe/WinRAR in 中文系统): 按 ACP(GBK)
+//   - Android / 现代工具 (MT管理器, 部分手机App)   : 按 UTF-8
+//   繁体系统工具可能按 Big5, 日文工具按 Shift-JIS.
+// 7z.dll 收到宽字符密码后, 内部按当前代码页(ACP)转字节, 因此对非 ACP 编码
+// 密码的包, 直接传宽字符会失败.
+// 解法: 通过 -enc 参数构造"按指定编码转字节, 再按 ACP 解码"的宽字符变体,
+//       7z.dll 把它按 ACP 编码回去恰好还原目标编码的原始字节, 即可解开.
+enum class PwdEncoding { Utf8, Gbk, Gb2312, Big5, ShiftJis };
+
+static wstring pwdVariant(const wstring& pwd, PwdEncoding enc) {
+    UINT cp;
+    switch (enc) {
+        case PwdEncoding::Utf8:    cp = CP_UTF8; break;
+        case PwdEncoding::Gbk:
+        case PwdEncoding::Gb2312:  cp = 936; break;
+        case PwdEncoding::Big5:    cp = 950; break;
+        case PwdEncoding::ShiftJis:cp = 932; break;
+        default: return L"";
+    }
+    // 与当前 ACP 相同: 原样传输即该编码, 无需变体
+    if ((UINT)GetACP() == cp) return L"";
+    int n = WideCharToMultiByte(cp, 0, pwd.c_str(), (int)pwd.size(), nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return L"";
+    string bytes(n, 0);
+    WideCharToMultiByte(cp, 0, pwd.c_str(), (int)pwd.size(), &bytes[0], n, nullptr, nullptr);
+    int m = MultiByteToWideChar(CP_ACP, 0, bytes.c_str(), (int)bytes.size(), nullptr, 0);
+    if (m <= 0) return L"";
+    wstring r(m, 0);
+    MultiByteToWideChar(CP_ACP, 0, bytes.c_str(), (int)bytes.size(), &r[0], m);
+    return r;
+}
+
+static vector<PwdEncoding> parseEncodings(const string& s) {
+    vector<PwdEncoding> r;
+    if (s.empty()) return r;
+    string t = s; for (auto& c : t) c = (char)tolower((unsigned char)c);
+    auto add = [&](PwdEncoding e) { for (auto x : r) if (x == e) return; r.push_back(e); };
+    size_t pos = 0;
+    while (pos <= t.size()) {
+        size_t nxt = t.find(',', pos);
+        string tok = t.substr(pos, nxt == string::npos ? string::npos : nxt - pos);
+        pos = (nxt == string::npos) ? t.size() + 1 : nxt + 1;
+        if (tok.empty()) continue;
+        if (tok == "utf8" || tok == "utf-8") add(PwdEncoding::Utf8);
+        else if (tok == "gbk") add(PwdEncoding::Gbk);
+        else if (tok == "gb2312" || tok == "gb18030") add(PwdEncoding::Gb2312);
+        else if (tok == "big5") add(PwdEncoding::Big5);
+        else if (tok == "sjis" || tok == "shiftjis" || tok == "shift_jis") add(PwdEncoding::ShiftJis);
+        else msg(L"[WARN]|未知编码: ", w8(tok), L" (支持: utf8,gbk,gb2312,big5,sjis)");
+    }
+    return r;
+}
+
 // ===================== Verify =====================
 enum class TestResult { Success, WrongPassword, Error };
 static auto isPwdErr = [](const wstring& m) -> bool {
@@ -225,11 +279,6 @@ struct ExtractorCtx {
         } catch (const bit7z::BitException& e) { wstring m=w8(e.what()); if (isPwdErr(m)) return TestResult::WrongPassword; err=m; return TestResult::Error; }
     }
 };
-
-// 单次测试封装 (密码本阶段用)
-static TestResult tryPwd7z(ExtractorCtx& ctx, const wstring& path, const vector<byte_t>* data, const wstring& pwd, wstring& err) {
-    return ctx.test(path, data, pwd, err);
-}
 
 // ===================== RAR fast-try (unrar.dll) =====================
 static TestResult tryPwdRarFast(const wstring& path, const wstring& pwd, const wstring& dllPath) {
@@ -265,6 +314,73 @@ static wstring mergeVols(const wstring& src, wstring& outPath) {
     } CloseHandle(hO); msg(L"[INFO]|分卷合并完成, 共",(size_t)(tot/1024/1024),L"MB"); return outPath;
 }
 
+// 删除压缩包及其所有分卷 (供 -d 使用)
+// 支持命名规律:
+//   name.001 / name.002 ...            (7z/ZIP 新分卷)
+//   name.r00 / name.r01 ...            (RAR4 旧式分卷)
+//   name.part1.rar / name.part2.rar ...(RAR5 分卷)
+//   name.part1 / name.part2 ...        (ZIP 分卷)
+//   name.part01.rar / name.part02.rar .(两位编号分卷)
+static void deleteArchiveVolumes(const wstring& src) {
+    error_code ec;
+    wstring low = src; for (auto& c : low) c = towlower(c);
+    size_t dp = low.find_last_of(L'.');
+
+    if (dp != wstring::npos) {
+        wstring ext = low.substr(dp+1);
+        // .r00 系列 → name.r00, name.r01, ...
+        if (ext == L"r00") {
+            wstring base = src.substr(0, dp+1);
+            int vn = 0;
+            while (true) {
+                wstring ns = to_wstring(vn); if (ns.size()<2) ns = L"0"+ns;
+                wstring vp = base + L"r" + ns;
+                if (GetFileAttributesW(vp.c_str()) == INVALID_FILE_ATTRIBUTES) break;
+                if (!fs::remove(vp, ec)) break;
+                vn++;
+            }
+            return;
+        }
+        // .001 系列 → name.001, name.002, ...
+        if (ext == L"001") {
+            wstring base = src.substr(0, dp+1);
+            int vn = 1;
+            while (true) {
+                wchar_t nb[16]; swprintf_s(nb, L"%03d", vn);
+                wstring vp = base + nb;
+                if (GetFileAttributesW(vp.c_str()) == INVALID_FILE_ATTRIBUTES) break;
+                if (!fs::remove(vp, ec)) break;
+                vn++;
+            }
+            return;
+        }
+        // .partN[.ext] 系列 → name.part1.rar, name.part2.rar, ... (或 name.part1, name.part2)
+        size_t pp = low.rfind(L".part");
+        if (pp != wstring::npos) {
+            size_t numStart = pp + 5; // 跳过 ".part"
+            size_t numEnd = numStart;
+            while (numEnd < low.size() && low[numEnd] >= L'0' && low[numEnd] <= L'9') numEnd++;
+            if (numEnd > numStart) {
+                int digits = (int)(numEnd - numStart);
+                int vn = (int)wcstoul(low.substr(numStart, digits).c_str(), nullptr, 10);
+                wstring head = src.substr(0, pp+5); // 含 ".part"
+                wstring tailExt = (numEnd < src.size() && src[numEnd] == L'.') ? src.substr(numEnd) : L"";
+                while (true) {
+                    wstring numStr = to_wstring(vn);
+                    while ((int)numStr.size() < digits) numStr = L"0" + numStr;
+                    wstring vp = head + numStr + tailExt;
+                    if (GetFileAttributesW(vp.c_str()) == INVALID_FILE_ATTRIBUTES) break;
+                    if (!fs::remove(vp, ec)) break;
+                    vn++;
+                }
+                return;
+            }
+        }
+    }
+    // 非分卷: 删除单文件
+    fs::remove(src, ec);
+}
+
 // ===================== Memory cache =====================
 struct MemArchive { vector<byte_t> data; bool valid=false;
     void load(const wstring& path, bool force) {
@@ -278,6 +394,42 @@ struct MemArchive { vector<byte_t> data; bool valid=false;
     }
 };
 
+// ===================== 统一验证: 一个候选密码 (含编码变体) =====================
+struct VerifyOutcome {
+    bool found = false;      // 密码正确
+    bool error = false;      // 验证出现硬错误 (非密码错误)
+    wstring errMsg;
+};
+
+static VerifyOutcome verifyPwd(
+    ExtractorCtx& ctx, const wstring& testPath, const vector<byte_t>* data,
+    const wstring& pwd, bool useUnrar, const wstring& urDll,
+    const vector<PwdEncoding>& encodings)
+{
+    VerifyOutcome o;
+    if (useUnrar) {
+        // unrar.dll: RARSetPassword 内部按 ACP 解码, 密码以宽字符为主, 无字节歧义, 只需原样
+        wstring err; TestResult r = tryPwdRarFast(testPath, pwd, urDll);
+        if (r == TestResult::Success) { o.found = true; return o; }
+        if (r == TestResult::Error) { o.error = true; o.errMsg = err.empty() ? L"unrar.dll 验证失败" : err; return o; }
+        return o;
+    }
+    // 7z.dll 路径: 先原样, 再按 -enc 指定的编码逐一尝试变体
+    wstring err;
+    TestResult r = data ? ctx.test(L"", data, pwd, err) : ctx.test(testPath, nullptr, pwd, err);
+    if (r == TestResult::Success) { o.found = true; return o; }
+    if (r == TestResult::Error) { o.error = true; o.errMsg = err; return o; }
+    for (auto enc : encodings) {
+        wstring v = pwdVariant(pwd, enc);
+        if (v.empty() || v == pwd) continue;
+        wstring err2;
+        TestResult r2 = data ? ctx.test(L"", data, v, err2) : ctx.test(testPath, nullptr, v, err2);
+        if (r2 == TestResult::Success) { o.found = true; return o; }
+        if (r2 == TestResult::Error) { o.error = true; o.errMsg = err2; return o; }
+    }
+    return o;
+}
+
 // ===================== Main =====================
 int wmain(int argc, wchar_t* argv[]) {
     SetConsoleOutputCP(CP_UTF8); (void)_setmode(_fileno(stdout), _O_BINARY);
@@ -285,8 +437,14 @@ int wmain(int argc, wchar_t* argv[]) {
     if (argc < 3 || (!cfg.isCompress && cfg.archivePath.empty())) {
         msg(L"[ERROR]|用法:"); 
         msg(L"  打包: 7z_to_dll.exe -z <目录/文件> -o <生成位置> [-n <名称>] [-k <质量>] [-i <类型>] [-d]");
-        msg(L"  解压: 7z_to_dll.exe -e <压缩包> [-o <目录>] [-ps <密码>]");
-        msg(L"  破解: 7z_to_dll.exe <压缩包> -c <字符集> -ts N -te N [-p <密码本>] [-s N] [-e N] [-b|-nb] [-tr N] [-bt N]"); return 1;
+        msg(L"  解压: 7z_to_dll.exe -e <压缩包> [-o <目录>] [-ps <密码>] [-enc <编码>]");
+        msg(L"  破解: 7z_to_dll.exe <压缩包> -c <字符集> -ts N -te N [-p <密码本>] [-s N] [-e N] [-b|-nb] [-pt N] [-enc <编码>]");
+        msg(L"  -enc: 密码编码变体, 逗号分隔 (utf8,gbk,gb2312,big5,sjis), 默认仅原样"); return 1;
+    }
+
+    vector<PwdEncoding> encodings = parseEncodings(cfg.encStr);
+    if (!encodings.empty()) {
+        msg(L"[INFO]|密码编码变体: ", w8(cfg.encStr));
     }
 
     // ===== COMPRESS =====
@@ -340,7 +498,7 @@ int wmain(int argc, wchar_t* argv[]) {
                 msg(L"[INFO]|压缩文件: ", cfg.compressSrc, L" → ", outPath, L" 等级=", (int)lvl);
                 cmp.compressFile(cfg.compressSrc, outPath);
             }
-            if (cfg.compressDelete) {
+            if (cfg.deleteSrc) {
                 msg(L"[INFO]|删除原文件: ", cfg.compressSrc);
                 error_code ec;
                 fs::remove_all(cfg.compressSrc, ec);
@@ -352,6 +510,7 @@ int wmain(int argc, wchar_t* argv[]) {
 
     if (GetFileAttributesW(cfg.archivePath.c_str())==INVALID_FILE_ATTRIBUTES) { msg(L"[ERROR]|压缩包不存在"); return 3; }
 
+    // ===== EXTRACT =====
     if (cfg.isExtract) {
         if (cfg.outDir.empty()) { size_t dp=cfg.archivePath.find_last_of(L'.'); cfg.outDir=cfg.archivePath.substr(0,dp); size_t sp=cfg.outDir.find_last_of(L"\\/"); if (sp!=wstring::npos) cfg.outDir=cfg.outDir.substr(sp+1); }
         wchar_t ed[1024]={}; GetModuleFileNameW(0,ed,1024); wstring ddd(ed); size_t ls=ddd.find_last_of(L"\\/"); wstring es=(ls!=wstring::npos)?ddd.substr(0,ls+1):L".";
@@ -361,16 +520,41 @@ int wmain(int argc, wchar_t* argv[]) {
         const auto& fmt=cfg.fileType.empty()?detectFmt(cfg.archivePath):parseType(cfg.fileType);
         wstring mf,ep=mergeVols(cfg.archivePath,mf); bool mg=(ep!=cfg.archivePath); if (mg) msg(L"[INFO]|分卷已合并");
         (void)CreateDirectoryW(cfg.outDir.c_str(),0);
-        try { bit7z::BitExtractor ex(*pL,fmt); ex.setPassword(cfg.extractPwd); uint64_t ts=0; ex.setTotalCallback([&ts](uint64_t s){ts=s;}); ex.setProgressCallback([&ts](uint64_t p){if(ts>0)msg(L"[EXTRACT]|",(size_t)(p*100/ts));});
-            msg(L"[INFO]|开始解压 → ",cfg.outDir); ex.extract(ep,cfg.outDir);
-            if (cfg.compressDelete) {
-                msg(L"[INFO]|删除压缩包: ", cfg.archivePath);
-                error_code ec;
-                fs::remove(cfg.archivePath, ec);
+
+        // 解压密码候选: 原样 + 各编码变体
+        vector<wstring> pwdCands;
+        pwdCands.push_back(cfg.extractPwd);
+        for (auto enc : encodings) {
+            wstring v = pwdVariant(cfg.extractPwd, enc);
+            if (!v.empty() && v != cfg.extractPwd) pwdCands.push_back(v);
+        }
+
+        bool extracted = false;
+        for (size_t pi = 0; pi < pwdCands.size() && !extracted; ++pi) {
+            const wstring& p = pwdCands[pi];
+            try {
+                bit7z::BitExtractor ex(*pL,fmt);
+                ex.setPassword(p);
+                // 先 test 验证密码, 再真正解压
+                ex.test(ep);
+                uint64_t ts=0; ex.setTotalCallback([&ts](uint64_t s){ts=s;}); ex.setProgressCallback([&ts](uint64_t pr){if(ts>0)msg(L"[EXTRACT]|",(size_t)(pr*100/ts));});
+                ex.setPassword(p);
+                msg(L"[INFO]|开始解压 → ",cfg.outDir); ex.extract(ep,cfg.outDir);
+                extracted = true;
+            } catch (const bit7z::BitException& e) {
+                wstring em = w8(e.what());
+                // 若是密码错误且还有候选 → 换下一个候选
+                if (isPwdErr(em) && pi + 1 < pwdCands.size()) continue;
+                msg(L"[ERROR]|解压失败: ",em);
+                if (mg) DeleteFileW(mf.c_str()); delete pL; return 7;
             }
-            msg(L"[DONE]|解压完成");
-            if (mg) DeleteFileW(mf.c_str()); delete pL; return 0; }
-        catch (const bit7z::BitException& e) { msg(L"[ERROR]|解压失败: ",w8(e.what())); if (mg) DeleteFileW(mf.c_str()); delete pL; return 7; }
+        }
+        if (cfg.deleteSrc) {
+            msg(L"[INFO]|删除压缩包及分卷: ", cfg.archivePath);
+            deleteArchiveVolumes(cfg.archivePath);
+        }
+        msg(L"[DONE]|解压完成");
+        if (mg) DeleteFileW(mf.c_str()); delete pL; return 0;
     }
 
     // ===== CRACK =====
@@ -418,21 +602,24 @@ int wmain(int argc, wchar_t* argv[]) {
         if (hT!=INVALID_HANDLE_VALUE) { LARGE_INTEGER fsz; GetFileSizeEx(hT,&fsz); CloseHandle(hT); useCache=((uint64_t)fsz.QuadPart<=1024ULL*1024*1024); } }
     MemArchive mA; if (useCache) { mA.load(testPath,cfg.cache==CacheMode::Force); if (!mA.valid) { msg(L"[INFO]|回退磁盘"); useCache=false; } }
 
-    int nThreads=cfg.threads; if (nThreads<=0) nThreads=(int)thread::hardware_concurrency(); if (nThreads<1) nThreads=1;
-    int bsz=cfg.batchSize; if (bsz<1) bsz=2048;
-
-    msg(L"[START]|总数=",totalPwds,L"|起始=",startIdx+1,L"|结束=",(endIdx==UINT64_MAX?L"末尾":to_wstring(endIdx+1)),
-        L"|线程=",nThreads,L"|批次=",bsz);
+    msg(L"[START]|总数=",totalPwds,L"|起始=",startIdx+1,L"|结束=",(endIdx==UINT64_MAX?L"末尾":to_wstring(endIdx+1)));
     msg(L"[INFO]|密码本=",book.bc,L"条|组合=",(totalPwds-book.bc),L"条");
 
     bool found=false;
-    mutex outMtx; atomic<bool> stopFlag{false}; uint64_t lastReported=startIdx;
 
-    // RAR 可靠性检测 (一次性, 全局有效; 提前到阶段1之前)
+    // RAR 可靠性检测 (一次性, 全局有效)
     bool rarUse7z=false;
     if (cfg.isRar) {
+        if (GetFileAttributesW(urDll.c_str())==INVALID_FILE_ATTRIBUTES) {
+            msg(L"[ERROR]|无法加载 unrar.dll (RAR解密需要)");
+            if (isMerged) DeleteFileW(mf.c_str()); delete pL; return 11;
+        }
         TestResult t1=tryPwdRarFast(testPath,L"__CHK_A__",urDll);
         TestResult t2=tryPwdRarFast(testPath,L"__CHK_B__",urDll);
+        if (t1==TestResult::Error && t2==TestResult::Error) {
+            msg(L"[ERROR]|unrar.dll 无法验证该RAR压缩包 (可能已损坏或不完整)");
+            if (isMerged) DeleteFileW(mf.c_str()); delete pL; return 7;
+        }
         rarUse7z=(t1==TestResult::Success&&t2==TestResult::Success);
         if (rarUse7z) msg(L"[INFO]|RAR加密文件名, 使用7z解密");
         else msg(L"[INFO]|RAR普通, 使用unrar解密");
@@ -440,106 +627,30 @@ int wmain(int argc, wchar_t* argv[]) {
 
     // === 阶段1: 密码本 (单线程, 逐条) ===
     uint64_t pbEnd=min(book.bc,(endIdx==UINT64_MAX?book.bc:endIdx+1));
-    for (uint64_t i=startIdx; i<pbEnd&&!stopFlag.load(); ++i) {
-        wstring pwd=book.get(i); msg(L"[STATUS]|",i+1,L"|",totalPwds,L"|",pwd);
-        wstring err; TestResult r;
-        if (cfg.isRar&&!rarUse7z) {
-            // unrar 已确认可靠: 成功即密码正确
-            r=tryPwdRarFast(testPath,pwd,urDll);
-        } else {
-            ExtractorCtx ctx; ctx.init(*pL,fmt,useCache);
-            r=tryPwd7z(ctx,testPath,useCache?&mA.data:nullptr,pwd,err);
+    {
+        ExtractorCtx ctx; if (!cfg.isRar||rarUse7z) ctx.init(*pL,fmt,useCache);
+        for (uint64_t i=startIdx; i<pbEnd&&!found; ++i) {
+            wstring pwd=book.get(i); msg(L"[STATUS]|",i+1,L"|",totalPwds,L"|",pwd);
+            VerifyOutcome o=verifyPwd(ctx,testPath,useCache?&mA.data:nullptr,pwd,cfg.isRar&&!rarUse7z,urDll,encodings);
+            if (o.found) { msg(L"[FOUND]|",pwd); found=true; break; }
+            if (o.error) { msg(L"[ERROR]|",o.errMsg); if (isMerged) DeleteFileW(mf.c_str()); delete pL; return 7; }
         }
-        if (r==TestResult::Success) { msg(L"[FOUND]|",pwd); found=true; stopFlag.store(true); break; }
-        if (r==TestResult::Error) { msg(L"[ERROR]|",err); if (isMerged) DeleteFileW(mf.c_str()); delete pL; return 7; }
     }
 
-    // === 阶段2: 暴力组合 ===
-    if (!stopFlag.load()&&totalPwds>book.bc) {
+    // === 阶段2: 暴力组合 (单线程) ===
+    if (!found&&totalPwds>book.bc) {
         uint64_t brStart=max(startIdx,book.bc);
         uint64_t brEnd=min((endIdx==UINT64_MAX?totalPwds-1:endIdx),totalPwds-1);
-        uint64_t brCount=(brEnd>=brStart)?(brEnd-brStart+1):0;
-        uint64_t lastPreserved=brStart;
-
-        // 是否启用多线程: 任务数>线程数 且 线程数>1
-        bool useMt=(brCount>(uint64_t)nThreads)&&(nThreads>1);
-        if (useMt) msg(L"[INFO]|多线程暴力: ",nThreads,L"线程, 批次",bsz);
-        else msg(L"[INFO]|单线程暴力, 任务数=",brCount);
-
-        // === 多线程 (+ 批量报告) ===
-        if (useMt) {
-            atomic<uint64_t> nextAtom{brStart};
-            atomic<uint64_t> doneCnt{0};
-
-            // Worker 统一入口
-            auto worker = [&](int tid) {
-                // 每个 worker 独立的验证上下文 (仅在需要 bit7z 时初始化)
-                ExtractorCtx ctx;
-                if (!cfg.isRar || rarUse7z) ctx.init(*pL, fmt, useCache);
-
-                while (!stopFlag.load()) {
-                    uint64_t base = nextAtom.fetch_add((uint64_t)bsz);
-                    if (base > brEnd) break;
-                    uint64_t lim = min(base + bsz - 1, brEnd);
-                    for (uint64_t i = base; i <= lim && !stopFlag.load(); ++i) {
-                        wstring pwd = book.get(i);
-                        wstring err; TestResult r;
-                        if (cfg.isRar && !rarUse7z) {
-                            // unrar 已确认可靠: 成功即密码正确
-                            r = tryPwdRarFast(testPath, pwd, urDll);
-                        } else {
-                            r = useCache ? ctx.test(L"", &mA.data, pwd, err) : ctx.test(testPath, nullptr, pwd, err);
-                        }
-                        if (r == TestResult::Success) {
-                            lock_guard<mutex> lk(outMtx); msg(L"[FOUND]|",pwd); found = true; stopFlag.store(true); break;
-                        }
-                        if (r == TestResult::Error) {
-                            lock_guard<mutex> lk(outMtx); msg(L"[ERROR]|",err); stopFlag.store(true); break;
-                        }
-                    }
-                    if (!stopFlag.load()) {
-                        uint64_t prev = doneCnt.fetch_add(bsz);
-                        // 主线程每隔一个批次报告进度
-                    }
-                }
-            };
-
-            vector<thread> workers; workers.reserve(nThreads);
-            for (int t=0; t<nThreads; ++t) workers.emplace_back(worker, t);
-
-            // 主线程轮询进度 → 每完成 bsz 条报告一次
-            while (!stopFlag.load()) {
-                this_thread::sleep_for(chrono::milliseconds(100));
-                uint64_t dc = doneCnt.load();
-                uint64_t completed = dc;  // bsz * batch count
-                uint64_t globalIdx = brStart + completed;
-                if (globalIdx > brEnd) globalIdx = brEnd;
-                if (completed > 0 && globalIdx != lastReported) {
-                    wstring mpwd = book.get(globalIdx);
-                    lock_guard<mutex> lk(outMtx);
-                    msg(L"[STATUS]|", globalIdx+1, L"|", totalPwds, L"|", mpwd);
-                    lastReported = globalIdx;
-                }
-            }
-            for (auto& t : workers) if (t.joinable()) t.join();
-        }
-
-        // === 单线程暴力 ===
-        else {
-            ExtractorCtx ctx; if (!cfg.isRar||rarUse7z) ctx.init(*pL,fmt,useCache);
-            for (uint64_t i=brStart; i<=brEnd&&!stopFlag.load(); ++i) {
-                wstring pwd=book.get(i);
-                bool brute=(i>=book.bc); bool sp=true;
-                if (brute) { if (cfg.printStep==0) sp=false; else if (cfg.printStep>1) { uint64_t bi=i-book.bc; sp=(bi%cfg.printStep==0); } }
-                if (sp) msg(L"[STATUS]|",i+1,L"|",totalPwds,L"|",pwd);
-                wstring err; TestResult r;
-                if (cfg.isRar&&!rarUse7z) {
-                    // unrar 已确认可靠: 成功即密码正确
-                    r=tryPwdRarFast(testPath,pwd,urDll);
-                } else r=useCache?ctx.test(L"",&mA.data,pwd,err):ctx.test(testPath,nullptr,pwd,err);
-                if (r==TestResult::Success) { msg(L"[FOUND]|",pwd); found=true; break; }
-                if (r==TestResult::Error) { msg(L"[ERROR]|",err); if (isMerged) DeleteFileW(mf.c_str()); delete pL; return 7; }
-            }
+        ExtractorCtx ctx; if (!cfg.isRar||rarUse7z) ctx.init(*pL,fmt,useCache);
+        msg(L"[INFO]|暴力阶段: ",(brEnd>=brStart?brEnd-brStart+1:0),L"条");
+        for (uint64_t i=brStart; i<=brEnd&&!found; ++i) {
+            wstring pwd=book.get(i);
+            bool brute=(i>=book.bc); bool sp=true;
+            if (brute) { if (cfg.printStep==0) sp=false; else if (cfg.printStep>1) { uint64_t bi=i-book.bc; sp=(bi%cfg.printStep==0); } }
+            if (sp) msg(L"[STATUS]|",i+1,L"|",totalPwds,L"|",pwd);
+            VerifyOutcome o=verifyPwd(ctx,testPath,useCache?&mA.data:nullptr,pwd,cfg.isRar&&!rarUse7z,urDll,encodings);
+            if (o.found) { msg(L"[FOUND]|",pwd); found=true; break; }
+            if (o.error) { msg(L"[ERROR]|",o.errMsg); if (isMerged) DeleteFileW(mf.c_str()); delete pL; return 7; }
         }
     }
 
