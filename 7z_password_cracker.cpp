@@ -1,11 +1,6 @@
-/** 7z Password Cracker v6 — 单线程 + 密码编码可选(-enc)
- *
- *  v6 变更:
- *   1. 彻底移除多线程 (unrar.dll 不可重入)
- *   2. 新增 -enc <编码列表> 参数: 构造密码编码变体, 支持 utf8/gbk/gb2312/big5/sjis,
- *      多值用逗号分隔; 默认不构造变体(仅原样, 按系统代码页)
- *   3. 移除 -tr / -bt 参数
- *   4. 修正 RAR unrar.dll 可用性检测
+/** 
+ * v1.2
+ * by HLBQ
  */
 
 #include <iostream>
@@ -394,7 +389,7 @@ struct MemArchive { vector<byte_t> data; bool valid=false;
     }
 };
 
-// ===================== 统一验证: 一个候选密码 (含编码变体) =====================
+// ===================== 统一验证一个候选密码 =====================
 struct VerifyOutcome {
     bool found = false;      // 密码正确
     bool error = false;      // 验证出现硬错误 (非密码错误)
@@ -461,7 +456,7 @@ int wmain(int argc, wchar_t* argv[]) {
         const bit7z::BitInOutFormat& cmpFmt = parseCompressType(cfg.compressType);
         wstring defExt = w8(cfg.compressType);
         if (defExt.empty() || defExt == L"7z" || defExt == L"gsp" || defExt == L"gspp") defExt = L"7z";
-        // 生成输出路径: outDir\name.ext
+        // 生成输出路径
         wstring outName = cfg.compressName;
         if (outName.empty()) {
             size_t sp = cfg.compressSrc.find_last_of(L"\\/"); wstring baseName = (sp != wstring::npos) ? cfg.compressSrc.substr(sp + 1) : cfg.compressSrc;
@@ -521,7 +516,7 @@ int wmain(int argc, wchar_t* argv[]) {
         wstring mf,ep=mergeVols(cfg.archivePath,mf); bool mg=(ep!=cfg.archivePath); if (mg) msg(L"[INFO]|分卷已合并");
         (void)CreateDirectoryW(cfg.outDir.c_str(),0);
 
-        // 解压密码候选: 原样 + 各编码变体
+        // 解压密码候选
         vector<wstring> pwdCands;
         pwdCands.push_back(cfg.extractPwd);
         for (auto enc : encodings) {
@@ -535,7 +530,7 @@ int wmain(int argc, wchar_t* argv[]) {
             try {
                 bit7z::BitExtractor ex(*pL,fmt);
                 ex.setPassword(p);
-                // 先 test 验证密码, 再真正解压
+                // 验证密码
                 ex.test(ep);
                 uint64_t ts=0; ex.setTotalCallback([&ts](uint64_t s){ts=s;}); ex.setProgressCallback([&ts](uint64_t pr){if(ts>0)msg(L"[EXTRACT]|",(size_t)(pr*100/ts));});
                 ex.setPassword(p);
@@ -543,7 +538,7 @@ int wmain(int argc, wchar_t* argv[]) {
                 extracted = true;
             } catch (const bit7z::BitException& e) {
                 wstring em = w8(e.what());
-                // 若是密码错误且还有候选 → 换下一个候选
+                // 换下一个候选
                 if (isPwdErr(em) && pi + 1 < pwdCands.size()) continue;
                 msg(L"[ERROR]|解压失败: ",em);
                 if (mg) DeleteFileW(mf.c_str()); delete pL; return 7;
@@ -607,7 +602,7 @@ int wmain(int argc, wchar_t* argv[]) {
 
     bool found=false;
 
-    // RAR 可靠性检测 (一次性, 全局有效)
+    // RAR 可靠性检测 
     bool rarUse7z=false;
     if (cfg.isRar) {
         if (GetFileAttributesW(urDll.c_str())==INVALID_FILE_ATTRIBUTES) {
@@ -625,7 +620,7 @@ int wmain(int argc, wchar_t* argv[]) {
         else msg(L"[INFO]|RAR普通, 使用unrar解密");
     }
 
-    // === 阶段1: 密码本 (单线程, 逐条) ===
+    // === 阶段1: 密码本  ===
     uint64_t pbEnd=min(book.bc,(endIdx==UINT64_MAX?book.bc:endIdx+1));
     {
         ExtractorCtx ctx; if (!cfg.isRar||rarUse7z) ctx.init(*pL,fmt,useCache);
@@ -637,7 +632,7 @@ int wmain(int argc, wchar_t* argv[]) {
         }
     }
 
-    // === 阶段2: 暴力组合 (单线程) ===
+    // === 阶段2: 暴力组合 ===
     if (!found&&totalPwds>book.bc) {
         uint64_t brStart=max(startIdx,book.bc);
         uint64_t brEnd=min((endIdx==UINT64_MAX?totalPwds-1:endIdx),totalPwds-1);
