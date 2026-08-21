@@ -52,7 +52,6 @@
 | `-d` | 否 | 打包后删除源文件 |
 
 ```cmd
-:: 案例：
 7z_to_dll.exe -z myfolder -o ./
 7z_to_dll.exe -z myfolder -o ./ -n backup -k 9 -i 7z
 7z_to_dll.exe -z myfile.txt -o ./ -n test -d
@@ -74,7 +73,6 @@
 | `-d` | 解压后删除压缩包及其所有分卷 （不稳定）|
 
 ```cmd
-:: 案例：
 7z_to_dll.exe -e 测试.7z -o extracted
 7z_to_dll.exe -e archive.rar -o output -ps 1234
 7z_to_dll.exe -e temp_test.zip -o ./ -ps 1234 -d
@@ -102,7 +100,6 @@
 | `-enc <编码>` | — | 密码编码变体，**支持编码**：`utf8` /`gbk`(默认) /`gb2312` /`big5` /`sjis` |
 
 ```cmd
-:: 案例：
 
 :: 纯暴力模式：字符集 1234，4位长度
 7z_to_dll.exe 测试.7z -c charset.txt -ts 4 -te 4
