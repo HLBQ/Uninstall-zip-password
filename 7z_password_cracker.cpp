@@ -1,5 +1,5 @@
 /** 
- * v1.2
+ * v1.3
  * by HLBQ
  */
 
@@ -253,11 +253,16 @@ static vector<PwdEncoding> parseEncodings(const string& s) {
 
 // ===================== Verify =====================
 enum class TestResult { Success, WrongPassword, Error };
+// 判断异常是否为"密码错误"。
+// 普通加密包: 密码错误时报 Wrong password / CRC 等。
+// 加密文件头的 7z (7zAES + Encrypt Header): 密码错误时 7z.dll 无法解密文件头,
+// 报 "Cannot open archive" 而非 Wrong password —— 也视为密码错误, 继续尝试下一行。
 static auto isPwdErr = [](const wstring& m) -> bool {
     wstring l=m; for (auto& c:l) c=towlower(c);
     return l.find(L"wrong password")!=wstring::npos||l.find(L"unknown error")!=wstring::npos||
            l.find(L"data error")!=wstring::npos||l.find(L"crc")!=wstring::npos||
-           l.find(L"incorrect")!=wstring::npos||l.find(L"password")!=wstring::npos;
+           l.find(L"incorrect")!=wstring::npos||l.find(L"password")!=wstring::npos||
+           l.find(L"cannot open archive")!=wstring::npos||l.find(L"can't open archive")!=wstring::npos;
 };
 
 struct ExtractorCtx {
@@ -612,11 +617,13 @@ int wmain(int argc, wchar_t* argv[]) {
         TestResult t1=tryPwdRarFast(testPath,L"__CHK_A__",urDll);
         TestResult t2=tryPwdRarFast(testPath,L"__CHK_B__",urDll);
         if (t1==TestResult::Error && t2==TestResult::Error) {
-            msg(L"[ERROR]|unrar.dll 无法验证该RAR压缩包 (可能已损坏或不完整)");
-            if (isMerged) DeleteFileW(mf.c_str()); delete pL; return 7;
+            // unrar.dll 读不了该 RAR (如带尾部附加数据/特殊结构), 回退 7z.dll 验证
+            msg(L"[INFO]|unrar.dll 无法识别该RAR, 回退 7z.dll");
+            rarUse7z = true;
+        } else {
+            rarUse7z=(t1==TestResult::Success&&t2==TestResult::Success);
         }
-        rarUse7z=(t1==TestResult::Success&&t2==TestResult::Success);
-        if (rarUse7z) msg(L"[INFO]|RAR加密文件名, 使用7z解密");
+        if (rarUse7z) msg(L"[INFO]|RAR加密文件名/特殊格式, 使用7z解密");
         else msg(L"[INFO]|RAR普通, 使用unrar解密");
     }
 
