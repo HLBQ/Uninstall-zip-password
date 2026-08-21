@@ -261,9 +261,9 @@ def crack(exe, archive, charset, ts, te, pb=None, start=1, end=0):
 
 ## 八、多线程
 
-> ⚠️ 本工具已不再支持多线程。
+>  本工具已不再支持多线程。
 
-- 破解全程为单线程执行（密码本阶段与暴力组合阶段均为单线程）
+- 破解全程为单线程执行
 - 已移除 `-tr`（线程数）与 `-bt`（批次大小）参数
 - 原因：`unrar.dll` 不可重入，多线程调用存在崩溃风险，且实际收益有限
 
@@ -284,7 +284,7 @@ def crack(exe, archive, charset, ts, te, pb=None, start=1, end=0):
 
 ## 十、密码编码变体
 
-**支持编码**：`utf8` /`gbk`(默认) /`gb2312` /`big5` /`sjis`
+**支持编码**：utf8 / gbk(默认) / gb2312 / big5 / sjis
 
 不写 -enc 时仅按默认尝试，失败不会回退到其他编码，因此密码总数不因编码变体而改变。
 
