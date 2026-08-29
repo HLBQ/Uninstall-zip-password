@@ -1,5 +1,5 @@
 /** 
- * v1.3
+ * v1.4
  * by HLBQ
  */
 
@@ -64,6 +64,26 @@ template<typename... Args> static void msg(const wchar_t* fmt, Args&&... args) {
 }
 
 // ===================== Format =====================
+// 魔数嗅探: 读文件头识别真实压缩格式
+// 解决"伪装 .7z/.zip 的 ZIP/RAR"类特殊包 
+static const bit7z::BitInFormat& sniffFmt(const wstring& p) {
+    FILE* f = _wfopen(p.c_str(), L"rb");
+    if (f) {
+        unsigned char h[8] = {0};
+        size_t rd = fread(h, 1, 8, f);
+        fclose(f);
+        if (rd >= 4 && h[0]=='P' && h[1]=='K') return bit7z::BitFormat::Zip;      // ZIP / 自解压ZIP
+        if (rd >= 6 && h[0]==0x37 && h[1]==0x7A && h[2]==0xBC && h[3]==0xAF && h[4]==0x27 && h[5]==0x1C) return bit7z::BitFormat::SevenZip;
+        // RAR5 魔数: "Rar!\x1a\x07\x01\x00"
+        if (rd >= 7 && h[0]=='R' && h[1]=='a' && h[2]=='r' && h[3]=='!' && h[4]==0x1A && h[5]==0x07 && h[6]==0x01) return bit7z::BitFormat::Rar5;
+        if (rd >= 2 && h[0]=='B' && h[1]=='Z') return bit7z::BitFormat::BZip2;
+        if (rd >= 2 && (h[0]==0xFD && h[1]=='7' || h[0]=='7' && h[1]=='z')) return bit7z::BitFormat::Xz;
+        if (rd >= 2 && h[0]==0x1F && h[1]==0x8B) return bit7z::BitFormat::GZip;
+    }
+    // 魔数无法识别时回退扩展名
+    return bit7z::BitFormat::SevenZip;
+}
+
 static const bit7z::BitInFormat& detectFmt(const wstring& p) {
     wstring e; size_t d = p.find_last_of(L'.');
     if (d != wstring::npos && d + 1 < p.length()) { e = p.substr(d+1); for (auto& c : e) c = towlower(c); }
@@ -77,7 +97,15 @@ static const bit7z::BitInFormat& detectFmt(const wstring& p) {
     if (e==L"001"||e==L"r00"||e==L"part1"||e==L"part01") {
         size_t s = p.find_last_of(L'.', d-1);
         if (s != wstring::npos && s+1 < d) { wstring in = p.substr(s+1,d-s-1); for (auto& c : in) c = towlower(c); auto* r = bi(in); if (r) return *r; }
-    } auto* r = bi(e); if (r) return *r; return bit7z::BitFormat::SevenZip;
+    }
+    auto* r = bi(e); if (r) return *r; return bit7z::BitFormat::SevenZip;
+}
+// -sniff 时魔数嗅探优先(解决伪装扩展名特殊包), 否则按扩展名
+static const bit7z::BitInFormat& detectFmtAuto(const wstring& p, bool sniffMagic) {
+    if (sniffMagic && GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        return sniffFmt(p);
+    }
+    return detectFmt(p);
 }
 static const bit7z::BitInFormat& parseType(const string& s) {
     string l = s; for (auto& c : l) c = (char)tolower((unsigned char)c);
@@ -109,6 +137,9 @@ struct CmdConfig {
     string fileType;
     string encStr; // -enc 密码编码列表, 逗号分隔; 空=仅原样
     CacheMode cache = CacheMode::Auto;
+    bool lightVerify = false; // -lv 轻量验证(仅读头, 不解压数据)
+    bool ignoreVerify = false; // -iv 解压忽略验证(跳过test, 直接extract)
+    bool sniffMagic = false;  // -sniff 魔数嗅探优先于扩展名(应对伪装扩展名特殊包)
     bool isRar = false, isExtract = false, isCompress = false, hasDict = false, hasPb = false;
     bool deleteSrc = false; // -d 解压/压缩后删除源文件
 };
@@ -145,6 +176,9 @@ static CmdConfig parseArgs(int argc, wchar_t* argv[]) {
         if (a == L"-d") { cfg.deleteSrc=true; continue; }
         if (a == L"-b") { cfg.cache=CacheMode::Force; continue; }
         if (a == L"-nb") { cfg.cache=CacheMode::Disable; continue; }
+        if (a == L"-lv") { cfg.lightVerify=true; continue; }
+        if (a == L"-iv") { cfg.ignoreVerify=true; continue; }
+        if (a == L"-sniff") { cfg.sniffMagic=true; continue; }
     }
     if (!cfg.archivePath.empty()) {
         size_t dp = cfg.archivePath.find_last_of(L'.');
@@ -268,11 +302,33 @@ static auto isPwdErr = [](const wstring& m) -> bool {
 struct ExtractorCtx {
     unique_ptr<bit7z::BitExtractor> fileEx;
     unique_ptr<bit7z::BitMemExtractor> memEx;
-    void init(const bit7z::Bit7zLibrary& l, const bit7z::BitInFormat& f, bool useMem) {
-        if (useMem) memEx.reset(new bit7z::BitMemExtractor(l,f)); else fileEx.reset(new bit7z::BitExtractor(l,f));
+    const bit7z::Bit7zLibrary* lib = nullptr;
+    const bit7z::BitInFormat* fmt = nullptr;
+    bool useMem = false;
+    bool lightVerify = false;
+
+    void init(const bit7z::Bit7zLibrary& l, const bit7z::BitInFormat& f, bool um, bool lv) {
+        lib = &l; fmt = &f; useMem = um; lightVerify = lv;
+        if (um) memEx.reset(new bit7z::BitMemExtractor(l,f)); else fileEx.reset(new bit7z::BitExtractor(l,f));
     }
+
+    // -lv 轻量密码验证: 仅打开归档读取头/条目, 不解压数据.
+    // 理由: ① 解压整个包极慢; ② 含损坏条目的包在解压时 CRC 失败,
+    //      会被误判为"密码错误"导致正确密码被跳过.
+    // 非 -lv 时沿用原逻辑: test() 完整解压校验 (性能慢但最准确).
     TestResult test(const wstring& path, const vector<byte_t>* data, const wstring& pwd, wstring& err) {
         try {
+            if (lightVerify) {
+                if (useMem && data) {
+                    bit7z::BitArchiveInfo info(*lib, *data, *fmt, pwd);
+                    (void)info.itemsCount();
+                } else {
+                    bit7z::BitArchiveInfo info(*lib, path, *fmt, pwd);
+                    (void)info.itemsCount();
+                }
+                return TestResult::Success;
+            }
+            // 原逻辑: 完整 test() 解压校验
             if (memEx) { memEx->setPassword(pwd); memEx->test(*data); }
             else { fileEx->setPassword(pwd); fileEx->test(path); }
             return TestResult::Success;
@@ -437,9 +493,12 @@ int wmain(int argc, wchar_t* argv[]) {
     if (argc < 3 || (!cfg.isCompress && cfg.archivePath.empty())) {
         msg(L"[ERROR]|用法:"); 
         msg(L"  打包: 7z_to_dll.exe -z <目录/文件> -o <生成位置> [-n <名称>] [-k <质量>] [-i <类型>] [-d]");
-        msg(L"  解压: 7z_to_dll.exe -e <压缩包> [-o <目录>] [-ps <密码>] [-enc <编码>]");
-        msg(L"  破解: 7z_to_dll.exe <压缩包> -c <字符集> -ts N -te N [-p <密码本>] [-s N] [-e N] [-b|-nb] [-pt N] [-enc <编码>]");
-        msg(L"  -enc: 密码编码变体, 逗号分隔 (utf8,gbk,gb2312,big5,sjis), 默认仅原样"); return 1;
+        msg(L"  解压: 7z_to_dll.exe -e <压缩包> [-o <目录>] [-ps <密码>] [-enc <编码>] [-iv]");
+        msg(L"  破解: 7z_to_dll.exe <压缩包> -c <字符集> -ts N -te N [-p <密码本>] [-s N] [-e N] [-b|-nb] [-pt N] [-enc <编码>] [-lv]");
+        msg(L"  -enc: 密码编码变体, 逗号分隔 (utf8,gbk,gb2312,big5,sjis), 默认仅原样");
+        msg(L"  -lv: 轻量验证(仅读头, 不解压), 应对含损坏条目的特殊包, 更快但可能漏判");
+        msg(L"  -iv: 忽略验证(解压时跳过test直接extract), 可实现部分恢复");
+        msg(L"  -sniff: 魔数嗅探优先于扩展名, 应对伪装扩展名的特殊包(如.7z实为ZIP)"); return 1;
     }
 
     vector<PwdEncoding> encodings = parseEncodings(cfg.encStr);
@@ -517,7 +576,7 @@ int wmain(int argc, wchar_t* argv[]) {
         const wchar_t* dl[]={L"7z.dll"}; bit7z::Bit7zLibrary* pL=0;
         for (auto d:dl) { wstring dp=es+d; if (GetFileAttributesW(dp.c_str())!=INVALID_FILE_ATTRIBUTES&&LoadLibraryW(dp.c_str())) { FreeLibrary(GetModuleHandleW(dp.c_str())); pL=new bit7z::Bit7zLibrary(dp); break; } }
         if (!pL) { msg(L"[ERROR]|无法加载7z DLL"); return 11; }
-        const auto& fmt=cfg.fileType.empty()?detectFmt(cfg.archivePath):parseType(cfg.fileType);
+        const auto& fmt=cfg.fileType.empty()?detectFmtAuto(cfg.archivePath,cfg.sniffMagic):parseType(cfg.fileType);
         wstring mf,ep=mergeVols(cfg.archivePath,mf); bool mg=(ep!=cfg.archivePath); if (mg) msg(L"[INFO]|分卷已合并");
         (void)CreateDirectoryW(cfg.outDir.c_str(),0);
 
@@ -532,19 +591,43 @@ int wmain(int argc, wchar_t* argv[]) {
         bool extracted = false;
         for (size_t pi = 0; pi < pwdCands.size() && !extracted; ++pi) {
             const wstring& p = pwdCands[pi];
+            // 统计输出目录已有文件数(用于部分恢复判断)
+            auto countFiles = [&]() -> size_t {
+                size_t n = 0;
+                error_code ec;
+                for (auto& ent : fs::recursive_directory_iterator(cfg.outDir, ec))
+                    if (ent.is_regular_file(ec)) ++n;
+                return n;
+            };
+
             try {
                 bit7z::BitExtractor ex(*pL,fmt);
                 ex.setPassword(p);
-                // 验证密码
-                ex.test(ep);
+                // -iv 忽略验证: 跳过整体 test() 预验证直接 extract.
+                // 含损坏条目的包, 不 -iv 时 test() 会在坏条目上 CRC 失败而 abort,
+                // 导致所有文件(包括完好的)都无法解出; 用 -iv 可让好文件先落盘,
+                // 坏条目单独报错, 实现"部分恢复".
+                if (!cfg.ignoreVerify) {
+                    ex.test(ep);   // 默认: 先整体验证
+                }
                 uint64_t ts=0; ex.setTotalCallback([&ts](uint64_t s){ts=s;}); ex.setProgressCallback([&ts](uint64_t pr){if(ts>0)msg(L"[EXTRACT]|",(size_t)(pr*100/ts));});
                 ex.setPassword(p);
                 msg(L"[INFO]|开始解压 → ",cfg.outDir); ex.extract(ep,cfg.outDir);
                 extracted = true;
             } catch (const bit7z::BitException& e) {
                 wstring em = w8(e.what());
-                // 换下一个候选
-                if (isPwdErr(em) && pi + 1 < pwdCands.size()) continue;
+                bool pwdErr = isPwdErr(em);
+                // -iv 模式下: 若已落盘部分文件且报 CRC 类错误 → 视为部分恢复成功
+                if (cfg.ignoreVerify && pwdErr) {
+                    size_t fcnt = countFiles();
+                    if (fcnt > 0) {
+                        msg(L"[WARN]|部分解压成功(",fcnt,L"个文件), 部分条目损坏: ", em);
+                        extracted = true;
+                        continue;
+                    }
+                }
+                // 密码错误且有下一个候选 → 换密码
+                if (pwdErr && pi + 1 < pwdCands.size()) continue;
                 msg(L"[ERROR]|解压失败: ",em);
                 if (mg) DeleteFileW(mf.c_str()); delete pL; return 7;
             }
@@ -589,7 +672,7 @@ int wmain(int argc, wchar_t* argv[]) {
     const wchar_t* dl[]={L"7z.dll"}; bit7z::Bit7zLibrary* pL=0;
     for (auto d:dl) { wstring dp=es+d; if (GetFileAttributesW(dp.c_str())!=INVALID_FILE_ATTRIBUTES&&LoadLibraryW(dp.c_str())) { FreeLibrary(GetModuleHandleW(dp.c_str())); pL=new bit7z::Bit7zLibrary(dp); break; } }
     if (!pL&&!cfg.isRar) { msg(L"[ERROR]|无法加载7z DLL"); return 11; }
-    wstring urDll=es+L"unrar.dll"; const auto& fmt=cfg.fileType.empty()?detectFmt(cfg.archivePath):parseType(cfg.fileType);
+    wstring urDll=es+L"unrar.dll"; const auto& fmt=cfg.fileType.empty()?detectFmtAuto(cfg.archivePath,cfg.sniffMagic):parseType(cfg.fileType);
     msg(L"[DBG]|exe目录: ",es);
 
     wstring mf, testPath=cfg.archivePath; bool isMerged=false;
@@ -630,7 +713,7 @@ int wmain(int argc, wchar_t* argv[]) {
     // === 阶段1: 密码本  ===
     uint64_t pbEnd=min(book.bc,(endIdx==UINT64_MAX?book.bc:endIdx+1));
     {
-        ExtractorCtx ctx; if (!cfg.isRar||rarUse7z) ctx.init(*pL,fmt,useCache);
+        ExtractorCtx ctx; if (!cfg.isRar||rarUse7z) ctx.init(*pL,fmt,useCache,cfg.lightVerify);
         for (uint64_t i=startIdx; i<pbEnd&&!found; ++i) {
             wstring pwd=book.get(i); msg(L"[STATUS]|",i+1,L"|",totalPwds,L"|",pwd);
             VerifyOutcome o=verifyPwd(ctx,testPath,useCache?&mA.data:nullptr,pwd,cfg.isRar&&!rarUse7z,urDll,encodings);
@@ -643,7 +726,7 @@ int wmain(int argc, wchar_t* argv[]) {
     if (!found&&totalPwds>book.bc) {
         uint64_t brStart=max(startIdx,book.bc);
         uint64_t brEnd=min((endIdx==UINT64_MAX?totalPwds-1:endIdx),totalPwds-1);
-        ExtractorCtx ctx; if (!cfg.isRar||rarUse7z) ctx.init(*pL,fmt,useCache);
+        ExtractorCtx ctx; if (!cfg.isRar||rarUse7z) ctx.init(*pL,fmt,useCache,cfg.lightVerify);
         msg(L"[INFO]|暴力阶段: ",(brEnd>=brStart?brEnd-brStart+1:0),L"条");
         for (uint64_t i=brStart; i<=brEnd&&!found; ++i) {
             wstring pwd=book.get(i);
