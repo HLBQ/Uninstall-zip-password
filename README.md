@@ -25,8 +25,8 @@
 
 | DLL | 来源 | 说明 |
 |-----|------|------|
-| `7z.dll` | 安装7-zip程序 , 从安装目录中 `C:\Program Files\7-Zip\7z.dll` 复制并重命名  |
-| `unrar.dll` | 下载aawc/unrar源码，编译出dll `unrar-7.13.0\UnRARDll.vcxproj`（Release x64） |
+| `7z.dll` | 安装7-zip程序 , 从安装目录中 `C:\Program Files\7-Zip\7z.dll` 复制并重命名  | 推荐版本26.01 |
+| `unrar.dll` | 下载aawc/unrar源码，编译出dll `unrar-7.13.0\UnRARDll.vcxproj`（Release x64） | 推荐版本7.13.0 |
 
 > [获取 unrar.dll   请认准：https://github.com/aawc/unrar](https://github.com/aawc/unrar)
 
